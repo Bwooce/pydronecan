@@ -491,14 +491,35 @@ class RxWorker:
 
 class TxWorker:
     QUEUE_BLOCK_TIMEOUT = 0.1
+    
+    # Dynamic frame intervals based on bus speed to maintain reasonable utilization
+    FRAME_INTERVAL_BY_BITRATE = {
+        125000:  0.020,  # 20ms -> 50Hz max (keep under 10% bus utilization)
+        250000:  0.010,  # 10ms -> 100Hz max
+        500000:  0.005,  # 5ms -> 200Hz max  
+        1000000: 0.002,  # 2ms -> 500Hz max (DroneCAN minimum)
+    }
 
-    def __init__(self, conn, rx_queue, tx_queue, termination_condition):
+    def __init__(self, conn, rx_queue, tx_queue, termination_condition, bitrate=DEFAULT_BITRATE):
         self._conn = conn
         self._rx_queue = rx_queue
         self._tx_queue = tx_queue
         self._termination_condition = termination_condition
+        self._last_frame_time = 0
+        
+        # Set frame interval based on bus speed
+        self._frame_interval = self.FRAME_INTERVAL_BY_BITRATE.get(bitrate, 0.002)
+        logger.info('TxWorker: Using frame interval %.3fms for %d bps', self._frame_interval * 1000, bitrate)
 
     def _send_frame(self, frame):
+        # Wall clock rate limiting for all adapters based on bus speed
+        current_time = time.monotonic()
+        time_since_last = current_time - self._last_frame_time
+        if time_since_last < self._frame_interval:
+            sleep_time = self._frame_interval - time_since_last
+            time.sleep(sleep_time)
+        self._last_frame_time = time.monotonic()
+
         marker = 'D' if frame.canfd else 'T'
         dlc_len = CANFrame.datalength_to_dlc(len(frame.data))
         line = '%s%X%s\r' % (('%c%08X' if frame.extended else 't%03X') % (marker, frame.id),
@@ -793,7 +814,8 @@ def _io_process(device,
                              tx_queue=tx_queue,
                              termination_condition=lambda: (should_exit or
                                                             not rxthd.is_alive() or
-                                                            not is_parent_process_alive()))
+                                                            not is_parent_process_alive()),
+                             bitrate=bitrate)
         tx_worker.run()
     except Exception as ex:
         logger.error('IO process failed', exc_info=True)
